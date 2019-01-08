@@ -1,0 +1,407 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+Packages
+```{r}
+library(odbc)
+library(tidyverse)
+library(DBI)
+library(parallel)
+
+#erase workspace and load clean one
+rm(list = ls())
+load('./env_clean.RData')
+
+# Calculate the number of cores
+no_cores <- detectCores() - 1
+no_cores
+# Initiate cluster
+cl <- makeCluster(no_cores)
+```
+
+#Big Picture Stuff
+
+##Problem Statment
+
+I want to make a tool or perform some analysis that results in making it easier for PSEs to find information. I want to avoid having to 'know what words to google.'
+
+That tool could be organizing wikis into topics so you could explore. Or reducing the number of wiki pages, making sure wikis are linked together enough.
+
+##Accessability
+
+What would make information more accessible? I would like a hierachy or a way to browse the information wihtout having to know 'what words to google' in the internal search. How would I learn the words to google? Maybe organinzg pages by tower?
+
+##ideas
+###graphing topology idea
+make graph with groups (tags or workspaces) and then have greyed or thickness of line represent number of connections form one group to another. 
+### topicalize it by tiles (it already is! Tags, workspace. Try to machine learn on it, try to organize it better?)
+* organize first by error code (and easy thing to classify by)
+* also classify by program
+* then classify by word topic?
+
+* 1) first do word count.
+
+* 2) next do multiple word combinations (presence absence) with the most common words (from 1, for performance)
+
+* 3) then do location pairs of mulitiple words (with the most from 2)
+
+###start with a smaller part of the data
+Start with just the playbooks, or just the KB articles.
+
+# Make connection
+## set connection
+```{r}
+# Use Microsoft SQL Server Management Studio to view heirarchy (tables) and columns and keys, 
+# MUCH easier. Use KEY folder to get the actual name of the key.
+
+lsp <- function(package, all.names = FALSE, pattern)
+{
+  package <- deparse(substitute(package))
+  ls(
+    pos = paste("package", package, sep = ":"),
+    all.names = all.names,
+    pattern = pattern
+  )
+}
+
+#lsp(odbc)
+#lsp(DBI)
+
+con <- dbConnect(odbc(),
+                 Driver = "SQL Server",
+                 Server = "TSWIKIAPPS",
+                 Database = "WikiWarehouse",
+                 UID = rstudioapi::askForPassword("Database user"),
+                 PWD = rstudioapi::askForPassword("Database password"),
+                 Trusted_Connection = "True")
+
+get_fields <- function(table, con) {
+  fields <- dbListFields(con, table)
+  tibble(table_name = table, field_name = fields)
+}
+
+databases <- dbListTables(con, table_name = 'Main%')
+databases
+
+db_fields <- databases %>% lapply(get_fields, con) %>% bind_rows()
+db_fields
+```
+## read in tables
+
+```{r}
+MainWikiPageLink <- dbReadTable(con,'MainWikiPageLink') %>% as.tibble()
+MainWikiPage <- dbReadTable(con,'MainWikiPage') %>% as.tibble()
+
+MainWikiTag <- dbReadTable(con,'MainWikiTag') %>% as.tibble()
+MainWikiPage2WikiTag <- dbReadTable(con,'MainWikiPage2WikiTag') %>% as.tibble()
+MainWikiTagGroup <- dbReadTable(con,'MainWikiTagGroup') %>% as.tibble()
+MainWikiTagGroup2WikiTag <- dbReadTable(con,'MainWikiTagGroup2WikiTag') %>% as.tibble()
+MainWikiWorkspace <- dbReadTable(con,'MainWikiWorkspace') %>% as.tibble()
+```
+
+# Data exploration
+
+## completed stuff
+### which pages are deleted?
+```{r message=FALSE, warning=FALSE}
+
+mwp %>% count(deleted)
+mwp_not_deleted <- mwp %>% filter(deleted != TRUE)
+```
+
+13k deleted, 68k not deleted, 310 NA
+No deleted pages are included in link table
+
+### Links (Topology)
+```{r}
+links
+
+# * find how to graph topology
+# All pages right, all pages left, heat map for connection, cluster? Or bin and do shades etc. Or do clustering algorithm.
+
+# range of the page id, 1 to 80k?
+links %>% ggplot(aes(from_page_id, to_page_id)) + geom_point(alpha = .05)
+
+# proves that deleted pages are not included in link table (good!)
+links %>% nrow()
+links %>% filter(!(from_page_id %in% mwp_not_deleted$page_id)) %>% nrow()
+links %>% filter(!(to_page_id %in% mwp_not_deleted$page_id)) %>% nrow()
+```
+
+Questions that arise from this: why are links in these quadrants? Why are only those boxes well linked? The rest don't seem to be linked at all.
+
+### Views
+```{r}
+mwp %>% arrange(id) %>% tail() #id is the page_id in the links table (1 to 81k)
+views_per_page <- mwp_not_deleted %>% select(id, views, likes) %>% arrange(desc(views)) %>% mutate(order = 1:n())
+views_per_page %>% ggplot(aes(id, views)) + geom_point()
+views_per_page %>% ggplot(aes(order,views)) + geom_point()
+views_per_page %>% ggplot(aes(order,log10(views + 1))) + geom_point()
+```
+
+How many pages are viewed 'often'
+```{r}
+total_pages <- views_per_page %>% nrow()
+more_than_100_views <- views_per_page %>% filter(views > 100) %>% nrow()
+paste0(round(100 - (total_pages / more_than_100_views),0),'% of pages have been viewed less than 100 times')
+```
+
+That seems like a lot of pages that aren't visited often. Are these pages useful or do they need to be combined? Archived?
+
+### Links vs Views
+
+```{r}
+links_to_or_from <- links %>% gather(direction, page_id) %>% group_by(page_id) %>% count() %>% arrange(desc(n)) %>%
+  rename(n_links_to_or_from = n)
+#links %>% gather(direction, page_id) %>% group_by(direction, page_id) %>% count() %>% arrange(desc(n))
+links_to_or_from
+mwp_not_deleted %>% left_join(links_to_or_from, c('id' = 'page_id')) %>%
+  ggplot(aes(log(views+1), log(n_links_to_or_from+1))) + geom_point()
+
+#include non-linked pages (with views)
+mwp_links <- mwp_not_deleted %>% left_join(links_to_or_from, c('id' = 'page_id'))
+mwp_links[is.na(mwp_links$n_links_to_or_from),"n_links_to_or_from"] <- 0
+mwp_links
+mwp_links %>% ggplot(aes(log(views+1), log(n_links_to_or_from+1))) + geom_point()
+
+#bin it and do scatter plots (discritize it by bin) (freqpoly?)
+mwp_links %>% ggplot(aes(1,log(views+1))) + geom_violin()
+```
+
+#### pages with at least one link have greater views than pages with no links
+```{r}
+mwp_links %>% ggplot(aes(log(views+1),..density..,color = (n_links_to_or_from == 0))) + geom_freqpoly()
+```
+Above is an interesting plot. Shows a slight (but obvious) trend that pages with at least one link (to or from) tend to have more views than pages without links.
+
+### topics by title (organize by title?)
+
+###Part 1: single words with high count
+
+```{r}
+# TODO be sure to somehow get rid of duplicate titles, so as not to mess up word count and topic organization.
+# TODO one idea to make this better, is whenever the word PI appears, take the next word with it. (e.g. PI Data Archive, PI Vision, etc)
+titles <- mwp_not_deleted %>% select(id, page_name)
+bag_of_words <- titles$page_name %>% str_split(' ',simplify = TRUE) %>% as.tibble() %>% 
+  mutate(page_id = titles$id) %>%
+  gather(placement, word, -page_id)
+
+#note: case matters!
+word_count <- bag_of_words %>% mutate(word = tolower(word)) %>% group_by(word) %>% count() %>% arrange(desc(n))
+word_count %>% View()
+
+word_count_high <- word_count %>% filter(n >= 100)
+word_count_high %>% nrow()
+```
+
+###Part 2: occurence of each pair of high count words
+```{r}
+#get every double combo of words (matrix) and the count of how often BOTH occur.
+word_pairs <- expand.grid(word_count_high$word, word_count_high$word, stringsAsFactors = FALSE)
+
+pair_occurence <- function(word1, word2) {
+  sum(grepl(word1,titles$page_name)&grepl(word2,titles$page_name))
+}
+#would take ~ 100 hours.
+#Sys.time()
+#word_pair_count <- word_pairs %>% mutate(freq = unlist(map2(Var1,Var2,pair_occurence)))
+#Sys.time()
+
+
+#106 hours, now I actually have to make this faster.
+```
+
+optimze time 21 seconds to split
+```{r}
+wch <- word_count_high %>% head()
+wp <- expand.grid(wch$word,wch$word, stringsAsFactors = FALSE)
+wp %>% mutate(freq = unlist(map2(Var1,Var2,pair_occurence))) #vectorize it!!
+
+titles %>% nrow()
+
+word_count %>% View()
+
+word_count_high <- word_count %>% filter(n >= 1000) #or hand pick some
+word_pairs <- expand.grid(word_count_high$word, word_count_high$word, stringsAsFactors = FALSE)
+
+#for 4k rows, this takes 20min, which is ridiculours!
+#2 words in a seconds. Not to helpful.
+Sys.time()
+pair_occur <- word_pairs %>% slice(4000:4010) %>% mutate(freq = unlist(map2(Var1,Var2,pair_occurence)))
+
+Sys.time()
+wp <- word_pairs
+wp_count <- vector('numeric', length = length(wp))
+for (i in 1:nrow(wp)) {
+  wp_count[i] <- sum(grepl(wp$Var1[i],titles$page_name,fixed = TRUE) &
+                       grepl(wp$Var2[i],titles$page_name,fixed = TRUE))
+}
+Sys.time()
+wp_count %>% as.tibble()
+titles %>% nrow() #another way to increase speed is to take pages that only have > 100 views. (reduce by 83%!!)
+Sys.time()
+
+#if I make all strings indexed factors would it be faster? or put them into numbers?
+
+#after have pair count, make graph of pairs that make a paper multiclassed, and pairs that reduce multiclassing.
+
+
+#just too many word pairs, start with fewer high count words
+
+#perhaps hand select words.
+```
+
+actually do it
+## Tags (what are they) #page types
+
+```{r}
+
+#filter by workspace = Customer Support Wiki
+
+#THIS IS A VITAL STEP. Looking just at tech support wiki brings from 80k pages to 7k pages!
+customer_support_workspace_id <- MainWikiWorkspace %>% 
+  filter(workspace_name == 'Customer Support Wiki') %>% 
+  .$id
+MainWikiPage_ts_only <- MainWikiPage %>% filter(workspace_id == customer_support_workspace_id)
+MainWikiPage
+
+#show tag distribution (categories)
+
+#redo all analysis but JUST with the customer support workspace wiki.
+
+MainWikiTag %>% colnames()
+MainWikiPage2WikiTag %>% colnames()
+MainWikiTagGroup %>% colnames()
+
+MainWikiPage %>% colnames()
+MainWikiPage %>% distinct(workspace_id)
+
+MainWikiTagGroup %>% distinct(category_name)
+MainWikiTagGroup %>% distinct(group_name)
+MainWikiTagGroup %>% distinct(category_name, group_name)
+
+MainWikiTag %>% distinct(tag_name)
+MainWikiTag %>% distinct(workspace_id, tag_name)
+MainWikiWorkspace %>% distinct(workspace_name)
+MainWikiWorkspace %>% distinct(workspace_id)
+MainWikiWorkspace %>% distinct(id)
+
+MainWikiPage2WikiTag %>% distinct(tag_name)
+MainWikiPage2WikiTag %>% distinct(page_id) %>% nrow()
+MainWikiPage2WikiTag %>% distinct(tag_id) %>% nrow()
+
+#tags are how wikis are grouped! I should investigate how to browse wiki's by tags.
+#tag groups too.
+
+MainWikiTagGroup %>% colnames()
+MainWikiWorkspace %>% colnames()
+```
+
+##topology diagram idea
+```{r}
+
+```
+
+
+START HERE NEXT TIME!! ABOVE, redo all analysis with the 7k filtered pages that are actually in the customer support thing.
+### workspaces (what are they)
+
+```{r}
+
+```
+
+
+
+# Old Stuff
+
+```{r}
+
+  ## what tables to we have? ====
+    #all tables returned (alot of SQL config stuff)
+    (tables <- dbListTables(con)) #will not use this info and probably not look into it.
+    
+    #all actual data tables
+    databases <- dbListTables(con, table_name = 'Main%')
+    databases
+    db_fields <- databases %>% lapply(get_fields, con) %>% bind_rows()
+    db_fields 
+    
+  ## define exactly what data is usuable ====
+    # MainWikiEvent #look at what events occur, how many users actually do actions etc, tag ids
+    # MainWikiEventAction #descriptions of action ids
+    # 
+    # #explore what tags are
+    #   MainWikiPage2WikiTag
+    #   MainWikiTag
+    #   MainWikiRevision2WikiTag
+    #   
+    # #explore how often revisions happen
+    #   MainWikiRevision
+    #   
+    # #User, group, workspace info (explore that? Who revises etc?)
+    #   
+    # MainWikiPage #rate of creation\deletion of wiki pages? (do we clean up as much as we create?)
+    #   deleted
+    #   likes
+    #   views
+    #   createdate
+    #   pagename?
+    #     
+    #   #most interested in how pages are linked, and if they can be linked more for easy finding of info?
+  
+  ##  graph data, and find questions in data ====
+    #see how many pages are deleted
+    #see which pages are deleted vs views
+  ## questions resulting from graphed data ====
+    ### what are wiki tags? ####  
+    #events (tracking what happened, who eddited etc?) ####
+    
+
+#assumes same name = key (but NOT ALWAYS THE CASE)
+db_fields %>% ggplot(aes(field_name, table_name)) + geom_point() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Traffic -------------------------------------------------------------------
+#Purpose: are all articles getting used?
+
+#seems like the below views could be optimzied. Some have 80k views, some have almost none.
+
+views_per_page <- mwp %>% select(id, views, likes) %>% arrange(desc(views)) %>% mutate(order = 1:n())
+views_per_page %>% ggplot(aes(id, views)) + geom_point()
+views_per_page %>% ggplot(aes(order,views)) + geom_point()
+views_per_page %>% ggplot(aes(order,log10(views + 1))) + geom_point()
+
+#we have over 80k pages!! I am sure we don't look at them all.
+
+# Topology (links) --------------------------------------------------------
+# Purpose: to see if the articles could be linked together more (or combined and reduced)
+links
+
+# * find how to graph topology
+# All pages right, all pages left, heat map for connection, cluster? Or bin and do shades etc. Or do clustering algorithm.
+
+# range of the page id, 1 to 80k?
+links %>% ggplot(aes(from_page_id, to_page_id)) + geom_point(alpha = .05)
+
+# Text --------------------------------------------------------------------
+
+
+# Make a new Heirarchy (by topic) -----------------------------------------
+# Purpose: to maximize searchability and access of information
+
+# possible handels to catagorize by:  
+  # MainWikiPage\page_name
+  # text (wherever that is?)
+```
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.

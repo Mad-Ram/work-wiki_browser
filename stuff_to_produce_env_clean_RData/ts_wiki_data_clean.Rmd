@@ -1,0 +1,193 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+#initialize
+```{r}
+library(odbc)
+library(tidyverse)
+library(DBI)
+library(parallel)
+
+#erase workspace and load clean one
+rm(list = ls())
+load('./env_clean.RData')
+
+# Calculate the number of cores
+no_cores <- detectCores() - 1
+no_cores
+# Initiate cluster
+cl <- makeCluster(no_cores)
+```
+
+#Big Picture Stuff
+
+##Problem Statment
+
+I want to make a tool or perform some analysis that results in making it easier for PSEs to find information. I want to avoid having to 'know what words to google.'
+
+That tool could be organizing wikis into topics so you could explore. Or reducing the number of wiki pages, making sure wikis are linked together enough.
+
+##Accessability
+
+What would make information more accessible? I would like a hierachy or a way to browse the information wihtout having to know 'what words to google' in the internal search. How would I learn the words to google? Maybe organinzg pages by tower?
+
+##ideas
+### organize
+instead of a hierarchy, how about a graphic that groups by how the pages are linked? With titles and key words shown.(implement a user-defined alias for page titles when using internal search?)
+
+
+###graphing topology idea
+make graph with groups (tags or workspaces) and then have greyed or thickness of line represent number of connections form one group to another. 
+### topicalize it by tiles (it already is! Tags, workspace. Try to machine learn on it, try to organize it better?)
+* organize first by error code (and easy thing to classify by)
+* also classify by program
+* then classify by word topic?
+
+* 1) first do word count.
+
+* 2) next do multiple word combinations (presence absence) with the most common words (from 1, for performance)
+
+* 3) then do location pairs of mulitiple words (with the most from 2)
+
+###start with a smaller part of the data
+Start with just the playbooks, or just the KB articles.
+
+#Code
+
+##filter by
+```{r}
+#THIS IS A VITAL STEP. Looking just at tech support wiki brings from 80k pages to 7k pages!
+customer_support_workspace_id <- MainWikiWorkspace %>% 
+  filter(workspace_name == 'Customer Support Wiki') %>% 
+  .$id
+MainWikiPage_filt <- MainWikiPage %>% filter(workspace_id == customer_support_workspace_id) %>%
+  filter(deleted == FALSE)
+```
+
+##topology graph idea
+###Make links table
+```{r}
+link_from_ts_page <- MainWikiPageLink %>% filter(from_page_id %in% MainWikiPage_filt$id)
+link_to_ts_page <- MainWikiPageLink %>% filter(to_page_id %in% MainWikiPage_filt$id)
+link_from_OR_to_ts_page <- MainWikiPageLink %>% filter((from_page_id %in% MainWikiPage_filt$id)|
+                                                      (to_page_id %in% MainWikiPage_filt$id))
+link_from_AND_to_ts_page <- MainWikiPageLink %>% filter((from_page_id %in% MainWikiPage_filt$id)&
+                                                      (to_page_id %in% MainWikiPage_filt$id))
+#going to work with link_from_AND_to_ts_page (i.e. not counting links that come from or go outside the ts wiki. I want to see how well internally connected the ts wiki is.)
+
+#do graph with unlinked points and without
+
+MainWikiPage_link <- MainWikiPage_filt %>% left_join(link_from_AND_to_ts_page, by = c('id'='from_page_id')) %>%
+  select(id, link_to_page_id = to_page_id, everything()) %>% distinct(id)
+```
+
+###topology of 2000 tags
+####Wiki is also split into 2000 smaller groups (kindof)
+_A PAGE CAN BE ASSIGNED MULTIPLE TAGS!_
+```{r}
+customer_support_workspace_id <- MainWikiWorkspace %>% 
+  filter(workspace_name == 'Customer Support Wiki') %>% 
+  .$id
+MainWikiTag %>% filter(workspace_id == customer_support_workspace_id) %>% distinct(tag_name)
+```
+
+####How many pages per tag? (recall, multiple tags per page)
+```{r}
+#how many pages per tag? (recall, multiple tags per page)
+  #get data into one table
+    MainWikiTag_ts <- MainWikiTag %>% filter(workspace_id == customer_support_workspace_id) %>% 
+      select(-workspace_id) %>% rename(tag_id = id)
+    MainWikiPage2WikiTag_ts <- MainWikiPage2WikiTag %>% filter((page_id %in% MainWikiPage_filt$id)&
+                                      (tag_id %in% MainWikiTag_ts$tag_id))
+    ts_page_id_to_tag_name <- left_join(MainWikiPage2WikiTag_ts,MainWikiTag_ts,by = "tag_id")
+    MainWikiPage_tags <- MainWikiPage_filt %>% select(-page_id, page_id = id) %>% #original page_id is abbrvieation of page_name, not the numeric page_id we are used to
+      left_join(ts_page_id_to_tag_name, by = 'page_id')
+
+MainWikiPage_tags %>% select(page_id, tag_name) %>% group_by(tag_name) %>% 
+  count() %>% arrange(desc(n))
+```
+Answer: it's complicated.
+
+####Graph topology in smaller groups (to do later)
+Tags would not be good groups to graph topology by, because they overlap a ton and are CRAZY variable in size.
+
+So the plan is to organize them into exclusive groups by text analysis, and then graph the topology (links) of those groups.
+
+###topology of 18 tool groups
+####wiki is split into 18 larger groups
+```{r}
+MainWikiTagGroup %>% distinct(category_name, group_name)
+```
+
+####How many pages per tag group?
+```{r}
+#a few tags are in multiple groups. ~1000
+  #MainWikiTagGroup2WikiTag %>% distinct(tag_id) %>% nrow()
+  #MainWikiTagGroup2WikiTag %>% distinct(group_id,tag_id) %>% nrow()
+  
+#add tag group to main data
+MainWikiPage_tags
+#MainWikiPage_tag_group <- 
+  MainWikiPage_tags %>% left_join(MainWikiTagGroup2WikiTag, by = "tag_id") %>% #made more rows. Why? because a tag can be in multiple go
+  rename(tag_group_id = group_id) %>%
+    left_join()
+  nrow()
+MainWikiPage_tag_group %>% colnames()
+MainWikiPage_tag_group %>% group_by(tag_group_id) %>% count() %>% arrange(desc(n))
+
+#graph in such away that it collapses to showing only one page (but multiple tag groups)
+
+
+```
+
+####Graph topology of 18 groups
+```{r}
+#make only one page be in one group? Or line for same doc and line for linked doc?
+MainWikiPage_tag_group
+```
+## restructure tags into a tree hierachy. Group them together.
+This is the top level tag groups
+```{r}
+MainWikiTagGroup
+```
+
+These will be the twigs, the end of the branches:
+```{r}
+MainWikiTag %>% nrow()
+MainWikiTag %>% head()
+```
+So pretty much I need to do a machine learning grouping or heirarichal clustering on the tags. If I have a browseable tree of the tags, it may be easier to browse wiki pages that way.
+
+### attempt one to make heirarichal clustering of tag names
+```{r}
+#insert amazing ML code here
+```
+
+With 14k tags, we may have to do some dimensional reduction first.
+1. first get code to combine case sensitive tags. ToLower() and distinct()
+2. browse, and try to come up with an algorithm to group or cluster them. Then take the one tag that is the 'most distinct' from the group, and call it that,
+  a. could do this by... I don't know.
+  b. could just take the first in the group, or select one randomly to be the 'title' of the group.
+  
+Or a set of predefined tags. All I am saying is 14k tags is unmaneagable to conceptualize or browse.
+
+### first try to make sense of a single products tags. (start with one tag group)
+```{r}
+#start with ID 15, PI Web Clients tag group.
+MainWikiTagGroup2WikiTag %>% count(group_id) %>% left_join(MainWikiTagGroup, by = c('group_id' = 'id'))
+MainWikiTagGroup2WikiTag %>% filter(group_id == 15)
+```
+There aren't a lot of tags in each tag group. Maybe these are the cream of the crop? Or these are just the pages that people actually used the tag group as?
+
+*Search through all of these wiki pages, see if can make a small hierarchy with these. A good starting project.
+
+
+#### make a table that maps tag groups to tags (have tag groups to pages, and pages to tags)
+
+## ideas
+### catagorize wikis by key words in titles? (might make it more browseable)
+The thing is, this has already been acomplished in a better-than-machine-learning way by users tagging it by themselves. So just use the tags, and find a graphic or an interactive way to browse the tags. Maybe group the tags together in a hierarchy and browse that way. But it is no problem if a wiki article shows up in more than one branch of the tree.
+
+
